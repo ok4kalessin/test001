@@ -1,9 +1,19 @@
-import time, json
+import json
+import time
+
 import azure.functions as func
+
 from hmac_utils import verify_request
 import store
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method != "GET":
+        return func.HttpResponse("Method Not Allowed", status_code=405)
+
+    accept = (req.headers.get("accept") or "application/json").lower()
+    if "application/json" not in accept and "*/*" not in accept:
+        return func.HttpResponse("Not Acceptable", status_code=406)
+
     now = int(time.time())
     ok, info, code = verify_request(
         now,

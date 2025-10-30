@@ -1,11 +1,32 @@
-import os, datetime, time, secrets as pysecrets, random
-from typing import Optional, Iterable
-from azure.data.tables import TableServiceClient, UpdateMode
-from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
-from azure.data.tables import TableTransactionError
+import os, datetime, time, secrets as pysecrets, random, logging
+from typing import Optional
+
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+from azure.data.tables import TableServiceClient, TableTransactionError, UpdateMode
+from azure.identity import DefaultAzureCredential
+
+LOG = logging.getLogger("store")
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        LOG.warning("Invalid %s value '%s'; using %d.", name, raw, default)
+        return default
+
 
 TABLE = os.environ.get("APPROVALS_TABLE", "approvals")
-_conn  = TableServiceClient.from_connection_string(os.environ["AzureWebJobsStorage"])
+ACCOUNT_URL = os.environ.get("STORAGE_ACCOUNT_URL")
+if not ACCOUNT_URL:
+    raise RuntimeError(
+        "STORAGE_ACCOUNT_URL must be configured for managed identity access to Table Storage."
+    )
+
+_conn = TableServiceClient(account_url=ACCOUNT_URL, credential=DefaultAzureCredential())
 _table = _conn.get_table_client(TABLE)
 try: _table.create_table()
 except Exception: pass
@@ -14,6 +35,9 @@ RETRY_BASE = 0.08   # seconds
 RETRY_MAX  = 5      # attempts
 
 def _iso() -> str: return datetime.datetime.utcnow().isoformat()+"Z"
+
+
+NONCE_RID_DAILY_LIMIT = max(1, _int_env("NONCE_RID_DAILY_LIMIT", 50))
 
 def _retry(fn, *a, **k):
     d = RETRY_BASE
@@ -77,6 +101,8 @@ def nonce_used_or_expired(rid: str, j: str, ts: int, skew: int, now: int) -> boo
         return True
     pk = _nonce_pk(ts)
     rid_nodash = rid.replace("-", "")
+    if _nonce_limit_exceeded(pk, rid, rid_nodash):
+        return True
     rk = f"{rid_nodash}_{j}"
     ent = {"PartitionKey": pk, "RowKey": rk, "ts": ts, "exp": ts + skew}
     try:
@@ -110,13 +136,49 @@ def _delete_partition(pk: str):
                 _batch_delete(batch); batch = []
         if batch:
             _batch_delete(batch)
-    except HttpResponseError:
-        pass
+    except HttpResponseError as exc:
+        LOG.warning("Failed to enumerate nonce partition %s for cleanup: %s", pk, exc)
 
 def _batch_delete(rows: list[tuple[str,str]]):
     ops = [("delete", {"PartitionKey": pk, "RowKey": rk}) for pk, rk in rows]
     try:
         _retry(_table.submit_transaction, ops)
-    except Exception:
-        pass
+    except Exception as exc:
+        LOG.warning("Failed to delete %d nonce rows from %s: %s", len(rows), rows[0][0] if rows else "n/a", exc)
+
+
+def _nonce_limit_exceeded(pk: str, rid: str, rid_nodash: str) -> bool:
+    limit = NONCE_RID_DAILY_LIMIT
+    if limit <= 0:
+        return False
+
+    prefix = f"{rid_nodash}_"
+    upper = f"{rid_nodash}_g"
+    query = f"PartitionKey eq '{pk}' and RowKey ge '{prefix}' and RowKey lt '{upper}'"
+
+    def _count() -> int:
+        seen = 0
+        pager = _table.query_entities(query, select=["RowKey"], results_per_page=limit)
+        for page in pager.by_page():
+            for _ in page:
+                seen += 1
+                if seen >= limit:
+                    return seen
+        return seen
+
+    try:
+        seen = _retry(_count)
+    except HttpResponseError:
+        raise
+
+    if seen >= limit:
+        LOG.warning(
+            "Rejecting nonce for rid %s; reached configured cap of %d entries in partition %s.",
+            rid,
+            limit,
+            pk,
+        )
+        return True
+
+    return False
 
